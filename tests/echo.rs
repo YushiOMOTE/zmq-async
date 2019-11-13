@@ -30,6 +30,9 @@ fn echo() {
         };
 
         cli.send_multipart(&["hi"]).await.unwrap();
-        assert_eq!(vec![b"hi".to_vec()], cli.recv_multipart().await.unwrap());
+        assert_eq!(
+            vec![b"hi".to_vec()],
+            cli.recv_multipart_as::<Vec<u8>>().await.unwrap()
+        );
     });
 }

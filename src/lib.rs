@@ -1,11 +1,11 @@
+mod convert;
 mod evented;
 mod waker;
 
-use crate::{evented::Evented, waker::TaskWaker};
+use crate::{convert::FromMessage, evented::Evented, waker::TaskWaker};
 use mio::Ready;
 use std::{
     io,
-    ops::{Deref, DerefMut},
     task::{Context, Poll},
 };
 use tokio::{future::poll_fn, net::util::PollEvented};
@@ -21,21 +21,19 @@ pub struct Socket {
     writable: bool,
 }
 
-impl Deref for Socket {
-    type Target = zmq::Socket;
-
-    fn deref(&self) -> &Self::Target {
-        &self.sock
-    }
-}
-
-impl DerefMut for Socket {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.sock
-    }
+/// Helper to clone `zmq::Message` object
+///
+/// Cloning messages is required before sending because
+/// `zmq` crate doesn't give back the message on EAGAIN.
+///
+/// https://github.com/erickt/rust-zmq/issues/211
+///
+fn copy_msg(msg: &zmq::Message) -> zmq::Message {
+    msg.to_vec().into()
 }
 
 impl Socket {
+    /// Create a async socket instance from `zmq::Socket`
     pub async fn new(sock: zmq::Socket) -> io::Result<Self> {
         let evented = PollEvented::new(Evented::new(sock.get_fd()?))?;
 
@@ -51,16 +49,79 @@ impl Socket {
         })
     }
 
-    pub async fn send_multipart<I, T>(&self, msgs: I) -> io::Result<()>
-    where
-        I: IntoIterator<Item = T> + Clone,
-        T: Into<zmq::Message>,
-    {
-        poll_fn(|cx| self.poll_write(cx, msgs.clone())).await
+    /// Provides reference to the underlying socket object.
+    pub fn socket(&self) -> &zmq::Socket {
+        &self.sock
     }
 
-    pub async fn recv_multipart(&self) -> io::Result<Vec<Vec<u8>>> {
-        poll_fn(|cx| self.poll_read(cx)).await
+    /// Provides mutable reference to the underlying socket object.
+    pub fn socket_mut(&mut self) -> &mut zmq::Socket {
+        &mut self.sock
+    }
+
+    /// Send a message.
+    pub async fn send<T>(&self, data: T, flags: i32) -> io::Result<()>
+    where
+        T: Into<zmq::Message>,
+    {
+        let msg = data.into();
+        poll_fn(|cx| self.poll_write(cx, &msg, flags)).await
+    }
+
+    /// Send a multi-part message.
+    pub async fn send_multipart<I, T>(&self, msgs: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<zmq::Message>,
+    {
+        let mut iter = msgs.into_iter().peekable();
+
+        while let Some(m) = iter.next() {
+            let flags = if iter.peek().is_some() {
+                zmq::SNDMORE
+            } else {
+                0
+            };
+            self.send(m, flags).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Receive a message.
+    pub async fn recv(&self) -> io::Result<zmq::Message> {
+        self.recv_as().await
+    }
+
+    /// Receive a message as a specific primitive type.
+    pub async fn recv_as<T>(&self) -> io::Result<T>
+    where
+        T: FromMessage,
+    {
+        let msg = poll_fn(|cx| self.poll_read(cx)).await?;
+        Ok(FromMessage::from(msg))
+    }
+
+    /// Receive a multi-part message.
+    pub async fn recv_multipart(&self) -> io::Result<Vec<zmq::Message>> {
+        self.recv_multipart_as().await
+    }
+
+    /// Receive a multi-part message as a specific primitive type.
+    pub async fn recv_multipart_as<T>(&self) -> io::Result<Vec<T>>
+    where
+        T: FromMessage,
+    {
+        let mut parts = vec![];
+        loop {
+            let part = self.recv_as().await?;
+            parts.push(part);
+
+            if !self.sock.get_rcvmore()? {
+                break;
+            }
+        }
+        Ok(parts)
     }
 
     /// Check the socket readiness via ZMQ_EVENTS.
@@ -101,11 +162,7 @@ impl Socket {
         Ok(())
     }
 
-    fn poll_write<I, T>(&self, cx: &mut Context, msgs: I) -> Poll<io::Result<()>>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<zmq::Message>,
-    {
+    fn poll_write(&self, cx: &mut Context, msg: &zmq::Message, flags: i32) -> Poll<io::Result<()>> {
         if !self.writable {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -113,7 +170,7 @@ impl Socket {
             )));
         }
 
-        match self.sock.send_multipart(msgs, zmq::DONTWAIT) {
+        match self.sock.send(copy_msg(msg), zmq::DONTWAIT | flags) {
             Ok(_) => {
                 self.wakeup_read()?;
                 Poll::Ready(Ok(()))
@@ -127,7 +184,7 @@ impl Socket {
         }
     }
 
-    fn poll_read(&self, cx: &mut Context) -> Poll<io::Result<Vec<Vec<u8>>>> {
+    fn poll_read(&self, cx: &mut Context) -> Poll<io::Result<zmq::Message>> {
         if !self.readable {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -135,7 +192,7 @@ impl Socket {
             )));
         }
 
-        match self.sock.recv_multipart(zmq::DONTWAIT) {
+        match self.sock.recv_msg(zmq::DONTWAIT) {
             Ok(msg) => {
                 self.wakeup_write()?;
                 Poll::Ready(Ok(msg))

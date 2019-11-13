@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sock = zmq_async::Socket::new(sock).await?;
     sock.send_multipart(&["hi"]).await?;
     println!("Sent");
-    let msgs = sock.recv_multipart().await?;
+    let msgs = sock.recv_multipart_as::<Vec<u8>>().await?;
     println!("Received: {:?}", msgs);
     assert_eq!(vec![b"hi".to_vec()], msgs);
 
