@@ -17,8 +17,6 @@ pub struct Socket {
     evented: PollEvented<Evented>,
     read: TaskWaker,
     write: TaskWaker,
-    readable: bool,
-    writable: bool,
 }
 
 /// Helper to clone `zmq::Message` object
@@ -37,15 +35,11 @@ impl Socket {
     pub async fn new(sock: zmq::Socket) -> io::Result<Self> {
         let evented = PollEvented::new(Evented::new(sock.get_fd()?))?;
 
-        let (readable, writable) = get_readwritable(sock.get_socket_type()?);
-
         Ok(Self {
             sock,
             evented,
             read: TaskWaker::new(),
             write: TaskWaker::new(),
-            readable,
-            writable,
         })
     }
 
@@ -146,7 +140,7 @@ impl Socket {
 
     /// Wake up task which is waiting for read
     fn wakeup_read(&self) -> io::Result<()> {
-        if self.check_readiness(zmq::POLLIN)? && self.readable {
+        if self.check_readiness(zmq::POLLIN)? {
             self.read.wake();
         }
 
@@ -155,7 +149,7 @@ impl Socket {
 
     /// Wake up task which is waiting for write
     fn wakeup_write(&self) -> io::Result<()> {
-        if self.check_readiness(zmq::POLLOUT)? && self.writable {
+        if self.check_readiness(zmq::POLLOUT)? {
             self.write.wake();
         }
 
@@ -163,13 +157,6 @@ impl Socket {
     }
 
     fn poll_write(&self, cx: &mut Context, msg: &zmq::Message, flags: i32) -> Poll<io::Result<()>> {
-        if !self.writable {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Socket is not writable",
-            )));
-        }
-
         match self.sock.send(copy_msg(msg), zmq::DONTWAIT | flags) {
             Ok(_) => {
                 self.wakeup_read()?;
@@ -185,13 +172,6 @@ impl Socket {
     }
 
     fn poll_read(&self, cx: &mut Context) -> Poll<io::Result<zmq::Message>> {
-        if !self.readable {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Socket is not readable",
-            )));
-        }
-
         match self.sock.recv_msg(zmq::DONTWAIT) {
             Ok(msg) => {
                 self.wakeup_write()?;
@@ -204,22 +184,5 @@ impl Socket {
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }
-    }
-}
-
-fn get_readwritable(socktype: zmq::SocketType) -> (bool, bool) {
-    match socktype {
-        zmq::SocketType::PUSH => (false, true),
-        zmq::SocketType::PULL => (true, false),
-        zmq::SocketType::PUB => (false, true),
-        zmq::SocketType::SUB => (true, false),
-        zmq::SocketType::XPUB => (true, true),
-        zmq::SocketType::XSUB => (true, true),
-        zmq::SocketType::REQ => (true, true),
-        zmq::SocketType::REP => (true, true),
-        zmq::SocketType::ROUTER => (true, true),
-        zmq::SocketType::DEALER => (true, true),
-        zmq::SocketType::PAIR => (true, true),
-        zmq::SocketType::STREAM => (true, true),
     }
 }
