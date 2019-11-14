@@ -1,22 +1,21 @@
 mod convert;
 mod evented;
-mod waker;
 
-use crate::{convert::FromMessage, evented::Evented, waker::TaskWaker};
+use crate::{convert::FromMessage, evented::Evented};
 use mio::Ready;
 use std::{
     io,
     task::{Context, Poll},
 };
-use tokio::{future::poll_fn, net::util::PollEvented};
+use tokio::{future::poll_fn, net::util::PollEvented, sync::AtomicWaker};
 
 pub use zmq;
 
 pub struct Socket {
     sock: zmq::Socket,
     evented: PollEvented<Evented>,
-    read: TaskWaker,
-    write: TaskWaker,
+    read: AtomicWaker,
+    write: AtomicWaker,
 }
 
 /// Helper to clone `zmq::Message` object
@@ -38,8 +37,8 @@ impl Socket {
         Ok(Self {
             sock,
             evented,
-            read: TaskWaker::new(),
-            write: TaskWaker::new(),
+            read: AtomicWaker::new(),
+            write: AtomicWaker::new(),
         })
     }
 
@@ -164,7 +163,7 @@ impl Socket {
             }
             Err(zmq::Error::EAGAIN) => {
                 self.evented.clear_read_ready(cx, Ready::readable())?;
-                self.write.register(cx.waker());
+                self.write.register(cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
@@ -179,7 +178,7 @@ impl Socket {
             }
             Err(zmq::Error::EAGAIN) => {
                 self.evented.clear_write_ready(cx)?;
-                self.read.register(cx.waker());
+                self.read.register(cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
