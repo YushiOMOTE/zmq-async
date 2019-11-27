@@ -8,9 +8,13 @@ edition = "2018"
 log = "0.4"
 zmq = "0.9.2"
 mio = "0.6"
-tokio = { git = "https://github.com/tokio-rs/tokio.git" }
+futures = "0.3"
+tokio = { version = "0.2", features = ["io-driver", "macros", "rt-core", "rt-threaded"] }
 serde = { version = "1.0", features = ["derive"] }
 lazy_static = "1.3"
 
 [dev-dependencies]
 structopt = "0.3"
+clap = "2.23"
+serde_json = "1.0"
+rmp-serde = "0.14"

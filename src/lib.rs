@@ -1,32 +1,22 @@
-mod convert;
 mod evented;
 
-use crate::{convert::FromMessage, evented::Evented};
+use crate::evented::Evented;
+use futures::future::poll_fn;
 use mio::Ready;
 use std::{
+    cell::RefCell,
     io,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
-use tokio::{future::poll_fn, net::util::PollEvented, sync::AtomicWaker};
+use tokio::io::PollEvented;
 
 pub use zmq;
 
 pub struct Socket {
     sock: zmq::Socket,
     evented: PollEvented<Evented>,
-    read: AtomicWaker,
-    write: AtomicWaker,
-}
-
-/// Helper to clone `zmq::Message` object
-///
-/// Cloning messages is required before sending because
-/// `zmq` crate doesn't give back the message on EAGAIN.
-///
-/// https://github.com/erickt/rust-zmq/issues/211
-///
-fn copy_msg(msg: &zmq::Message) -> zmq::Message {
-    msg.to_vec().into()
+    read: RefCell<Option<Waker>>,
+    write: RefCell<Option<Waker>>,
 }
 
 impl Socket {
@@ -37,8 +27,8 @@ impl Socket {
         Ok(Self {
             sock,
             evented,
-            read: AtomicWaker::new(),
-            write: AtomicWaker::new(),
+            read: RefCell::new(None),
+            write: RefCell::new(None),
         })
     }
 
@@ -52,69 +42,18 @@ impl Socket {
         &mut self.sock
     }
 
-    /// Send a message.
-    pub async fn send<T>(&self, data: T, flags: i32) -> io::Result<()>
-    where
-        T: Into<zmq::Message>,
-    {
-        let msg = data.into();
-        poll_fn(|cx| self.poll_write(cx, &msg, flags)).await
-    }
-
     /// Send a multi-part message.
-    pub async fn send_multipart<I, T>(&self, msgs: I) -> io::Result<()>
+    pub async fn send_multipart<T>(&self, msgs: &[T]) -> io::Result<()>
     where
-        I: IntoIterator<Item = T>,
-        T: Into<zmq::Message>,
+        T: AsRef<[u8]>,
     {
-        let mut iter = msgs.into_iter().peekable();
-
-        while let Some(m) = iter.next() {
-            let flags = if iter.peek().is_some() {
-                zmq::SNDMORE
-            } else {
-                0
-            };
-            self.send(m, flags).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Receive a message.
-    pub async fn recv(&self) -> io::Result<zmq::Message> {
-        self.recv_as().await
-    }
-
-    /// Receive a message as a specific primitive type.
-    pub async fn recv_as<T>(&self) -> io::Result<T>
-    where
-        T: FromMessage,
-    {
-        let msg = poll_fn(|cx| self.poll_read(cx)).await?;
-        Ok(FromMessage::from(msg))
+        let msgs: Vec<&[u8]> = msgs.iter().map(|m| m.as_ref()).collect();
+        poll_fn(|cx| self.poll_write(cx, &msgs)).await
     }
 
     /// Receive a multi-part message.
-    pub async fn recv_multipart(&self) -> io::Result<Vec<zmq::Message>> {
-        self.recv_multipart_as().await
-    }
-
-    /// Receive a multi-part message as a specific primitive type.
-    pub async fn recv_multipart_as<T>(&self) -> io::Result<Vec<T>>
-    where
-        T: FromMessage,
-    {
-        let mut parts = vec![];
-        loop {
-            let part = self.recv_as().await?;
-            parts.push(part);
-
-            if !self.sock.get_rcvmore()? {
-                break;
-            }
-        }
-        Ok(parts)
+    pub async fn recv_multipart(&self) -> io::Result<Vec<Vec<u8>>> {
+        poll_fn(|cx| self.poll_read(cx)).await
     }
 
     /// Check the socket readiness via ZMQ_EVENTS.
@@ -132,56 +71,59 @@ impl Socket {
     ///
     /// (From ZMQ_FD section in http://api.zeromq.org/4-1:zmq-getsockopt)
     ///
-    fn check_readiness(&self, events: zmq::PollEvents) -> io::Result<bool> {
-        let flg = self.sock.get_events()?;
-        Ok((flg & events).is_empty())
-    }
-
     /// Wake up task which is waiting for read
-    fn wakeup_read(&self) -> io::Result<()> {
-        if self.check_readiness(zmq::POLLIN)? {
-            self.read.wake();
-        }
-
-        Ok(())
+    fn wakeup_read(&self) {
+        self.read.borrow().as_ref().map(|w| w.wake_by_ref());
     }
 
     /// Wake up task which is waiting for write
-    fn wakeup_write(&self) -> io::Result<()> {
-        if self.check_readiness(zmq::POLLOUT)? {
-            self.write.wake();
-        }
-
-        Ok(())
+    fn wakeup_write(&self) {
+        self.write.borrow().as_ref().map(|w| w.wake_by_ref());
     }
 
-    fn poll_write(&self, cx: &mut Context, msg: &zmq::Message, flags: i32) -> Poll<io::Result<()>> {
-        match self.sock.send(copy_msg(msg), zmq::DONTWAIT | flags) {
-            Ok(_) => {
-                self.wakeup_read()?;
-                Poll::Ready(Ok(()))
+    fn sleep_read(&self, cx: &Context) {
+        self.read.borrow_mut().replace(cx.waker().clone());
+    }
+
+    fn sleep_write(&self, cx: &Context) {
+        self.write.borrow_mut().replace(cx.waker().clone());
+    }
+
+    fn poll_write(&self, cx: &mut Context, msg: &[&[u8]]) -> Poll<io::Result<()>> {
+        let events = self.sock.get_events()?;
+
+        if events.intersects(zmq::POLLOUT) {
+            match self.sock.send_multipart(msg, zmq::DONTWAIT) {
+                Ok(_) => Poll::Ready(Ok(())),
+                Err(zmq::Error::EAGAIN) => unreachable!(),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-            Err(zmq::Error::EAGAIN) => {
-                self.evented.clear_read_ready(cx, Ready::readable())?;
-                self.write.register(cx.waker().clone());
-                Poll::Pending
+        } else {
+            self.evented.clear_write_ready(cx)?;
+            if events.intersects(zmq::POLLIN) {
+                self.wakeup_read();
             }
-            Err(e) => Poll::Ready(Err(e.into())),
+            self.sleep_write(cx);
+            Poll::Pending
         }
     }
 
-    fn poll_read(&self, cx: &mut Context) -> Poll<io::Result<zmq::Message>> {
-        match self.sock.recv_msg(zmq::DONTWAIT) {
-            Ok(msg) => {
-                self.wakeup_write()?;
-                Poll::Ready(Ok(msg))
+    fn poll_read(&self, cx: &mut Context) -> Poll<io::Result<Vec<Vec<u8>>>> {
+        let events = self.sock.get_events()?;
+
+        if events.intersects(zmq::POLLIN) {
+            match self.sock.recv_multipart(zmq::DONTWAIT) {
+                Ok(msg) => Poll::Ready(Ok(msg)),
+                Err(zmq::Error::EAGAIN) => unreachable!(),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-            Err(zmq::Error::EAGAIN) => {
-                self.evented.clear_write_ready(cx)?;
-                self.read.register(cx.waker().clone());
-                Poll::Pending
+        } else {
+            self.evented.clear_read_ready(cx, Ready::readable())?;
+            if events.intersects(zmq::POLLOUT) {
+                self.wakeup_write();
             }
-            Err(e) => Poll::Ready(Err(e.into())),
+            self.sleep_read(cx);
+            Poll::Pending
         }
     }
 }
